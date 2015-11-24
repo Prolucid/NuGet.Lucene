@@ -90,25 +90,26 @@ namespace NuGet.Lucene.Web.Controllers
                 return result;
             }
 
-            if (Request.Headers.Range != null)
-            {
-                try
-                {
-                    HttpResponseMessage partialResponse = Request.CreateResponse(HttpStatusCode.PartialContent);
-                    partialResponse.Content = new ByteRangeStreamContent(package.GetStream(), Request.Headers.Range, new MediaTypeWithQualityHeaderValue("application/zip"));
-                    return partialResponse;
-                }
-                catch (InvalidByteRangeException e)
-                {
-                    return Request.CreateErrorResponse(HttpStatusCode.BadRequest, e);
-                }
-            }
-
-            result = Request.CreateResponse(HttpStatusCode.OK);
+            var partial = Request.Headers.Range != null;
+            result = Request.CreateResponse(partial ? HttpStatusCode.PartialContent : HttpStatusCode.OK);
             if (Request.Method == HttpMethod.Get)
             {
-                result.Content = new StreamContent(package.GetStream());
-                TaskRunner.QueueBackgroundWorkItem(cancellationToken => LuceneRepository.IncrementDownloadCountAsync(package, cancellationToken));
+                if (partial)
+                {
+                    try
+                    {
+                        result.Content = new ByteRangeStreamContent(package.GetStream(), Request.Headers.Range, new MediaTypeWithQualityHeaderValue("application/zip"));
+                    }
+                    catch (InvalidByteRangeException e)
+                    {
+                        return Request.CreateErrorResponse(HttpStatusCode.BadRequest, e);
+                    }
+                }
+                else
+                {
+                    result.Content = new StreamContent(package.GetStream());
+                    TaskRunner.QueueBackgroundWorkItem(cancellationToken => LuceneRepository.IncrementDownloadCountAsync(package, cancellationToken));
+                }
             }
             else
             {
@@ -116,16 +117,19 @@ namespace NuGet.Lucene.Web.Controllers
             }
 
             result.Headers.ETag = new EntityTagHeaderValue('"' + package.PackageHash + '"');
-            result.Content.Headers.ContentType = new MediaTypeWithQualityHeaderValue("application/zip");
             result.Content.Headers.LastModified = package.LastUpdated;
-            result.Content.Headers.ContentDisposition = new ContentDispositionHeaderValue(DispositionTypeNames.Attachment)
+
+            if (!partial)
+            {
+                result.Content.Headers.ContentType = new MediaTypeWithQualityHeaderValue("application/zip");
+                result.Content.Headers.ContentDisposition = new ContentDispositionHeaderValue(DispositionTypeNames.Attachment)
                 {
                     FileName = string.Format("{0}.{1}{2}", package.Id, package.Version, Constants.PackageExtension),
                     Size = package.PackageSize,
                     CreationDate = package.Created,
                     ModificationDate = package.LastUpdated,
                 };
-
+            }
             return result;
         }
 
