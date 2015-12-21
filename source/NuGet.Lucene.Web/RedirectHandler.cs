@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Threading;
@@ -33,6 +34,13 @@ namespace NuGet.Lucene.Web
             if (url == null)
             {
                 throw new InvalidOperationException(string.Format("No route named {0} matched request.", routeName));
+            }
+
+            var uriScheme = request.Headers.Where(h => h.Key.ToLower() == "x-forwarded-proto").SelectMany(h => h.Value).FirstOrDefault();
+            if (uriScheme != null)
+            {
+                if (string.Equals(uriScheme, "https", StringComparison.InvariantCultureIgnoreCase))
+                    return new UriBuilder(url) { Scheme = Uri.UriSchemeHttps }.Uri;
             }
 
             return new Uri(url);

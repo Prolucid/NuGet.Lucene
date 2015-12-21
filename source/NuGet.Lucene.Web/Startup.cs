@@ -182,6 +182,7 @@ namespace NuGet.Lucene.Web
 
             config.MessageHandlers.Add(new CrossOriginMessageHandler(Settings.EnableCrossDomainRequests));
             config.Filters.Add(new ExceptionLoggingFilter());
+            config.Filters.Add(new ProxyHttpsProtoFilter());
 
             var documentation = new HtmlDocumentation();
             documentation.Load();
