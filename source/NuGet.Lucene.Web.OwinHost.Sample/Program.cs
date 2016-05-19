@@ -30,7 +30,7 @@ namespace NuGet.Lucene.Web.OwinHost.Sample
                 log.Fatal(m => m(ex.Message), ex);
             }
 
-            Console.WriteLine("Press enter to exit.");
+            Console.WriteLine("Press enter to exit.");	
             Console.ReadLine();
         }
 

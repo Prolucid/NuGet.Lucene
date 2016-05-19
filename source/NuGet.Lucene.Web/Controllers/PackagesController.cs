@@ -16,9 +16,499 @@ using NuGet.Lucene.Util;
 using NuGet.Lucene.Web.Models;
 using NuGet.Lucene.Web.Symbols;
 using NuGet.Lucene.Web.Util;
+using System.IO;
 
 namespace NuGet.Lucene.Web.Controllers
 {
+	internal static class HttpHeaderExtensions
+	{
+		public static void CopyTo(this HttpContentHeaders fromHeaders, HttpContentHeaders toHeaders)
+		{
+			foreach (KeyValuePair<string, IEnumerable<string>> header in fromHeaders)
+			{
+				toHeaders.TryAddWithoutValidation(header.Key, header.Value);
+			}
+		}
+	}
+
+	internal abstract class DelegatingStream : Stream
+	{
+		private Stream _innerStream;
+
+		protected DelegatingStream(Stream innerStream)
+		{
+			if (innerStream == null)
+			{
+				throw new ArgumentNullException();
+			}
+			_innerStream = innerStream;
+		}
+
+		protected Stream InnerStream
+		{
+			get { return _innerStream; }
+		}
+
+		public override bool CanRead
+		{
+			get { return _innerStream.CanRead; }
+		}
+
+		public override bool CanSeek
+		{
+			get { return _innerStream.CanSeek; }
+		}
+
+		public override bool CanWrite
+		{
+			get { return _innerStream.CanWrite; }
+		}
+
+		public override long Length
+		{
+			get { return _innerStream.Length; }
+		}
+
+		public override long Position
+		{
+			get { return _innerStream.Position; }
+			set { _innerStream.Position = value; }
+		}
+
+		public override int ReadTimeout
+		{
+			get { return _innerStream.ReadTimeout; }
+			set { _innerStream.ReadTimeout = value; }
+		}
+
+		public override bool CanTimeout
+		{
+			get { return _innerStream.CanTimeout; }
+		}
+
+		public override int WriteTimeout
+		{
+			get { return _innerStream.WriteTimeout; }
+			set { _innerStream.WriteTimeout = value; }
+		}
+
+		protected override void Dispose(bool disposing)
+		{
+			if (disposing)
+			{
+				_innerStream.Dispose();
+			}
+			base.Dispose(disposing);
+		}
+
+		public override long Seek(long offset, SeekOrigin origin)
+		{
+			return _innerStream.Seek(offset, origin);
+		}
+
+		public override int Read(byte[] buffer, int offset, int count)
+		{
+			return _innerStream.Read(buffer, offset, count);
+		}
+
+		public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+		{
+			return _innerStream.ReadAsync(buffer, offset, count, cancellationToken);
+		}
+
+		#if !NETFX_CORE // BeginX and EndX not supported on Streams in portable libraries
+		public override IAsyncResult BeginRead(byte[] buffer, int offset, int count, AsyncCallback callback, object state)
+		{
+		return _innerStream.BeginRead(buffer, offset, count, callback, state);
+		}
+
+		public override int EndRead(IAsyncResult asyncResult)
+		{
+		return _innerStream.EndRead(asyncResult);
+		}
+		#endif
+
+		public override int ReadByte()
+		{
+			return _innerStream.ReadByte();
+		}
+
+		public override void Flush()
+		{
+			_innerStream.Flush();
+		}
+
+		public override Task CopyToAsync(Stream destination, int bufferSize, CancellationToken cancellationToken)
+		{
+			return _innerStream.CopyToAsync(destination, bufferSize, cancellationToken);
+		}
+
+		public override Task FlushAsync(CancellationToken cancellationToken)
+		{
+			return _innerStream.FlushAsync(cancellationToken);
+		}
+
+		public override void SetLength(long value)
+		{
+			_innerStream.SetLength(value);
+		}
+
+		public override void Write(byte[] buffer, int offset, int count)
+		{
+			_innerStream.Write(buffer, offset, count);
+		}
+
+		public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+		{
+			return _innerStream.WriteAsync(buffer, offset, count, cancellationToken);
+		}
+
+		#if !NETFX_CORE // BeginX and EndX not supported on Streams in portable libraries
+		public override IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback callback, object state)
+		{
+		return _innerStream.BeginWrite(buffer, offset, count, callback, state);
+		}
+
+		public override void EndWrite(IAsyncResult asyncResult)
+		{
+		_innerStream.EndWrite(asyncResult);
+		}
+		#endif
+
+		public override void WriteByte(byte value)
+		{
+			_innerStream.WriteByte(value);
+		}
+	}
+
+	internal class ByteRangeStream : DelegatingStream
+	{
+		// The offset stream position at which the range starts.
+		private readonly long _lowerbounds;
+
+		// The total number of bytes within the range. 
+		private readonly long _totalCount;
+
+		// The current number of bytes read into the range
+		private long _currentCount;
+
+		public ByteRangeStream(Stream innerStream, RangeItemHeaderValue range)
+			: base(innerStream)
+		{
+			// Ranges are inclusive so 0-9 means the first 10 bytes
+			long maxLength = innerStream.Length - 1;
+			long upperbounds;
+			if (range.To.HasValue)
+			{
+				if (range.From.HasValue)
+				{
+					// e.g bytes=0-499 (the first 500 bytes offsets 0-499)
+					upperbounds = Math.Min(range.To.Value, maxLength);
+					_lowerbounds = range.From.Value;
+				}
+				else
+				{
+					// e.g bytes=-500 (the final 500 bytes)
+					upperbounds = maxLength;
+					_lowerbounds = Math.Max(innerStream.Length - range.To.Value, 0);
+				}
+			}
+			else
+			{
+				if (range.From.HasValue)
+				{
+					// e.g bytes=500- (from byte offset 500 and up)
+					upperbounds = maxLength;
+					_lowerbounds = range.From.Value;
+				}
+				else
+				{
+					// e.g. bytes=- (invalid so will never get here)
+					upperbounds = maxLength;
+					_lowerbounds = 0;
+				}
+			}
+
+			_totalCount = upperbounds - _lowerbounds + 1;
+			ContentRange = new ContentRangeHeaderValue(_lowerbounds, upperbounds, innerStream.Length);
+		}
+
+		public ContentRangeHeaderValue ContentRange { get; private set; }
+
+		public override long Length
+		{
+			get { return _totalCount; }
+		}
+
+		public override bool CanWrite
+		{
+			get { return false; }
+		}
+
+		public override Task CopyToAsync(Stream destination, int bufferSize, CancellationToken cancellationToken)
+		{
+			int effectiveCount = PrepareStreamForRangeRead(1);
+			if (effectiveCount <= 0)
+			{
+				throw new IndexOutOfRangeException();
+			}
+			return base.CopyToAsync(destination, bufferSize, cancellationToken);
+		}
+
+		public override IAsyncResult BeginRead(byte[] buffer, int offset, int count, AsyncCallback callback, object state)
+		{
+			return base.BeginRead(buffer, offset, PrepareStreamForRangeRead(count), callback, state);
+		}
+
+		public override int Read(byte[] buffer, int offset, int count)
+		{
+			return base.Read(buffer, offset, PrepareStreamForRangeRead(count));
+		}
+
+		public override int ReadByte()
+		{
+			int effectiveCount = PrepareStreamForRangeRead(1);
+			if (effectiveCount <= 0)
+			{
+				return -1;
+			}
+			return base.ReadByte();
+		}
+
+		public override void SetLength(long value)
+		{
+			throw new NotSupportedException();
+		}
+
+		public override void Write(byte[] buffer, int offset, int count)
+		{
+			throw new NotSupportedException();
+		}
+
+		public override IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback callback, object state)
+		{
+			throw new NotSupportedException();
+		}
+
+		public override void EndWrite(IAsyncResult asyncResult)
+		{
+			throw new NotSupportedException();
+		}
+
+		public override void WriteByte(byte value)
+		{
+			throw new NotSupportedException();
+		}
+
+		/// <summary>
+		/// Gets the 
+		/// </summary>
+		/// <param name="count">The count requested to be read by the caller.</param>
+		/// <returns>The remaining bytes to read within the range defined for this stream.</returns>
+		private int PrepareStreamForRangeRead(int count)
+		{
+			long effectiveCount = Math.Min(count, _totalCount - _currentCount);
+			if (effectiveCount > 0)
+			{
+				// Check if we should update the stream position
+				long position = InnerStream.Position;
+				if (_lowerbounds + _currentCount != position)
+				{
+					InnerStream.Position = _lowerbounds + _currentCount;
+				}
+
+				// Update current number of bytes read
+				_currentCount += effectiveCount;
+			}
+
+			// Effective count can never be bigger than int
+			return (int)effectiveCount;
+		}
+	}
+		/// <summary>
+		/// <see cref="HttpContent"/> implementation which provides a byte range view over a stream used to generate HTTP
+		/// 206 (Partial Content) byte range responses. The <see cref="ByteRangeStreamContent"/> supports one or more 
+		/// byte ranges regardless of whether the ranges are consecutive or not. If there is only one range then a 
+		/// single partial response body containing a Content-Range header is generated. If there are more than one
+		/// ranges then a multipart/byteranges response is generated where each body part contains a range indicated
+		/// by the associated Content-Range header field.
+		/// </summary>
+		public class ByteRangeStreamContent : HttpContent
+		{
+			private const string SupportedRangeUnit = "bytes";
+			private const string ByteRangesContentSubtype = "byteranges";
+			private const int DefaultBufferSize = 4096;
+			private const int MinBufferSize = 1;
+
+			private readonly Stream _content;
+			private readonly long _start;
+			private readonly HttpContent _byteRangeContent;
+			private bool _disposed;
+
+			/// <summary>
+			/// <see cref="HttpContent"/> implementation which provides a byte range view over a stream used to generate HTTP
+			/// 206 (Partial Content) byte range responses. If none of the requested ranges overlap with the current extend 
+			/// of the selected resource represented by the <paramref name="content"/> parameter then an 
+			/// <see cref="InvalidByteRangeException"/> is thrown indicating the valid Content-Range of the content. 
+			/// </summary>
+			/// <param name="content">The stream over which to generate a byte range view.</param>
+			/// <param name="range">The range or ranges, typically obtained from the Range HTTP request header field.</param>
+			/// <param name="mediaType">The media type of the content stream.</param>
+			public ByteRangeStreamContent(Stream content, RangeHeaderValue range, string mediaType)
+				: this(content, range, new MediaTypeHeaderValue(mediaType), DefaultBufferSize)
+			{
+			}
+
+			/// <summary>
+			/// <see cref="HttpContent"/> implementation which provides a byte range view over a stream used to generate HTTP
+			/// 206 (Partial Content) byte range responses. If none of the requested ranges overlap with the current extend 
+			/// of the selected resource represented by the <paramref name="content"/> parameter then an 
+			/// <see cref="InvalidByteRangeException"/> is thrown indicating the valid Content-Range of the content. 
+			/// </summary>
+			/// <param name="content">The stream over which to generate a byte range view.</param>
+			/// <param name="range">The range or ranges, typically obtained from the Range HTTP request header field.</param>
+			/// <param name="mediaType">The media type of the content stream.</param>
+			/// <param name="bufferSize">The buffer size used when copying the content stream.</param>
+			public ByteRangeStreamContent(Stream content, RangeHeaderValue range, string mediaType, int bufferSize)
+				: this(content, range, new MediaTypeHeaderValue(mediaType), bufferSize)
+			{
+			}
+
+			/// <summary>
+			/// <see cref="HttpContent"/> implementation which provides a byte range view over a stream used to generate HTTP
+			/// 206 (Partial Content) byte range responses. If none of the requested ranges overlap with the current extend 
+			/// of the selected resource represented by the <paramref name="content"/> parameter then an 
+			/// <see cref="InvalidByteRangeException"/> is thrown indicating the valid Content-Range of the content. 
+			/// </summary>
+			/// <param name="content">The stream over which to generate a byte range view.</param>
+			/// <param name="range">The range or ranges, typically obtained from the Range HTTP request header field.</param>
+			/// <param name="mediaType">The media type of the content stream.</param>
+			public ByteRangeStreamContent(Stream content, RangeHeaderValue range, MediaTypeHeaderValue mediaType)
+				: this(content, range, mediaType, DefaultBufferSize)
+			{
+			}
+
+			/// <summary>
+			/// <see cref="HttpContent"/> implementation which provides a byte range view over a stream used to generate HTTP
+			/// 206 (Partial Content) byte range responses. If none of the requested ranges overlap with the current extend 
+			/// of the selected resource represented by the <paramref name="content"/> parameter then an 
+			/// <see cref="InvalidByteRangeException"/> is thrown indicating the valid Content-Range of the content. 
+			/// </summary>
+			/// <param name="content">The stream over which to generate a byte range view.</param>
+			/// <param name="range">The range or ranges, typically obtained from the Range HTTP request header field.</param>
+			/// <param name="mediaType">The media type of the content stream.</param>
+			/// <param name="bufferSize">The buffer size used when copying the content stream.</param>
+			public ByteRangeStreamContent(Stream content, RangeHeaderValue range, MediaTypeHeaderValue mediaType, int bufferSize)
+			{
+
+				try
+				{
+					// If we have more than one range then we use a multipart/byteranges content type as wrapper.
+					// Otherwise we use a non-multipart response.
+					if (range.Ranges.Count > 1)
+					{
+						// Create Multipart content and copy headers to this content
+						MultipartContent rangeContent = new MultipartContent(ByteRangesContentSubtype);
+						_byteRangeContent = rangeContent;
+
+						foreach (RangeItemHeaderValue rangeValue in range.Ranges)
+						{
+							try
+							{
+								ByteRangeStream rangeStream = new ByteRangeStream(content, rangeValue);
+								HttpContent rangeBodyPart = new StreamContent(rangeStream, bufferSize);
+								rangeBodyPart.Headers.ContentType = mediaType;
+								rangeBodyPart.Headers.ContentRange = rangeStream.ContentRange;
+								rangeContent.Add(rangeBodyPart);
+							}
+							catch (ArgumentOutOfRangeException)
+							{
+								// We ignore range errors until we check that we have at least one valid range
+							}
+						}
+
+						// If no overlapping ranges were found then stop
+						if (!rangeContent.Any())
+						{
+							ContentRangeHeaderValue actualContentRange = new ContentRangeHeaderValue(content.Length);
+							string msg = "ByteRangeStreamNoneOverlap";
+							throw new InvalidByteRangeException(actualContentRange, msg);
+						}
+					}
+					else if (range.Ranges.Count == 1)
+					{
+						try
+						{
+							ByteRangeStream rangeStream = new ByteRangeStream(content, range.Ranges.First());
+							_byteRangeContent = new StreamContent(rangeStream, bufferSize);
+							_byteRangeContent.Headers.ContentType = mediaType;
+							_byteRangeContent.Headers.ContentRange = rangeStream.ContentRange;
+						}
+						catch (ArgumentOutOfRangeException)
+						{
+							ContentRangeHeaderValue actualContentRange = new ContentRangeHeaderValue(content.Length);
+							string msg = "ByteRangeStreamNoOverlap";
+							throw new InvalidByteRangeException(actualContentRange, msg);
+						}
+					}
+					else
+					{
+						throw new ArgumentException("range");
+					}
+
+					// Copy headers from byte range content so that we get the right content type etc.
+					_byteRangeContent.Headers.CopyTo(Headers);
+
+					_content = content;
+					_start = content.Position;
+				}
+				catch
+				{
+					if (_byteRangeContent != null)
+					{
+						_byteRangeContent.Dispose();
+					}
+					throw;
+				}
+			}
+
+			protected override Task SerializeToStreamAsync(Stream stream, TransportContext context)
+			{
+				// Reset stream to start position
+				_content.Position = _start;
+
+				// Copy result to output
+				return _byteRangeContent.CopyToAsync(stream);
+			}
+
+			protected override bool TryComputeLength(out long length)
+			{
+				long? contentLength = _byteRangeContent.Headers.ContentLength;
+				if (contentLength.HasValue)
+				{
+					length = contentLength.Value;
+					return true;
+				}
+
+				length = -1;
+				return false;
+			}
+
+			protected override void Dispose(bool disposing)
+			{
+				if (disposing)
+				{
+					if (!_disposed)
+					{
+						_byteRangeContent.Dispose();
+						_content.Dispose();
+						_disposed = true;
+					}
+				}
+				base.Dispose(disposing);
+			}
+	}
+
     /// <summary>
     /// Provides methods to search, get metadata, download, upload and delete packages.
     /// </summary>
