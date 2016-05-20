@@ -598,6 +598,7 @@ namespace NuGet.Lucene.Web.Controllers
                 else
                 {
                     result.Content = new StreamContent(package.GetStream());
+                    result.Headers.AcceptRanges.Add("bytes");
                     TaskRunner.QueueBackgroundWorkItem(cancellationToken => LuceneRepository.IncrementDownloadCountAsync(package, cancellationToken));
                 }
             }

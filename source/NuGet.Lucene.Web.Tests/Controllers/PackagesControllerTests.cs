@@ -162,7 +162,7 @@ namespace NuGet.Lucene.Web.Tests.Controllers
         [Test]
         public async Task DownloadPackageSendsRange()
         {
-            request.Headers.Range = new RangeHeaderValue(1, package.PackageSize - 1);
+            request.Headers.Range = new RangeHeaderValue(1,null);
             var result = DownloadPackage(HttpMethod.Get, "SomePackage", SampleVersion.SemanticVersion);
 
             Assert.That(result.StatusCode, Is.EqualTo(HttpStatusCode.PartialContent));
